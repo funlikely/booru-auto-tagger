@@ -53,7 +53,7 @@ Schema:
 ```sql
 CREATE TABLE images (
     id          INTEGER PRIMARY KEY,
-    path        TEXT UNIQUE NOT NULL,   -- absolute or relative to configured root
+    path        TEXT UNIQUE NOT NULL,   -- relative to configured image_root
     rating      TEXT,                  -- 'safe' | 'questionable' | 'explicit'
     tagged_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     manually_reviewed INTEGER DEFAULT 0
@@ -168,7 +168,8 @@ GET  /images
      ?order=random|id|path       (default: random)
      ?limit=20                   (default: 20, max: 200)
      ?offset=0
-     → { total: N, images: [ { id, path, rating, categories, raw_tags } ] }
+     → { total: N, images: [ { id, path, url, rating, categories, raw_tags } ] }
+     (path = relative to image_root; url = ready-to-use /files/<path>)
 
 GET  /images/<id>
      → single image record with full tag data
@@ -189,8 +190,9 @@ GET  /health                     → { status: "ok", image_count: N }
 
 Notes:
 - [ ] `flask-cors` enabled so the dating sim can query from a different origin/port
-- [ ] All image paths returned as absolute paths (or configurable base URL for serving images)
-- [ ] Add `GET /images/<id>/file` to serve the actual image file if needed
+- [ ] All image paths returned as relative paths (relative to `image_root` in config)
+- [ ] `GET /files/<path:filename>` resolves to `os.path.join(image_root, filename)` — safe against path traversal via `send_from_directory`
+- [ ] API responses include both `path` (relative) and a `url` field pre-built as `/files/<path>` so clients don't have to construct it
 - [ ] Keep auth out of scope for now — this is a local tool
 
 ---
@@ -224,10 +226,10 @@ Single `index.html` shell that loads one of two JS modules based on a toggle sto
 ---
 
 ### 9. Image serving
-- [ ] `server.py` should serve images from the configured image root via `GET /files/<path:filename>`
-- [ ] Use `send_from_directory` (Flask) — safe against path traversal
-- [ ] Optional: generate thumbnails on first request, cache to `~/.cache/booru-auto-tagger/thumbs/`
+- [ ] `server.py` serves images via `GET /files/<path:filename>` using Flask's `send_from_directory(image_root, filename)` — `image_root` comes from config, never from the request
+- [ ] Optional: generate thumbnails on first request, cache to `~/.cache/booru-auto-tagger/thumbs/` mirroring the relative path structure
   - Thumbnails at 400px wide, JPEG quality 80 — big win for frontend performance at 51k images
+  - Thumbnail endpoint: `GET /thumbs/<path:filename>` — same relative path, separate endpoint
 
 ---
 
@@ -251,10 +253,10 @@ GET /images/random?mood=smile,happy&clothing=school_uniform&rating=safe
 ```
 
 Recommendations:
-- Cache the server URL in the dating sim's config
+- Cache the server URL in the dating sim's config; use the `url` field from responses directly (it's `/files/<relative-path>`) rather than reconstructing paths
 - Use `rating` filter aggressively to stay in appropriate content zones per scene
-- Consider adding a `character` filter later if your images are organized by character subdirectory — easy to add as a column on `images`
-- If the dating sim needs deterministic selection (same image for same game state), pass `?order=id&seed=<state_hash>` — or add a `seed` param to the random query later
+- Consider adding a `character` filter later if your images are organized by character subdirectory — the relative path already encodes this (e.g. `characters/akari/pose001.jpg`), so it's easy to add as a queryable prefix filter
+- If the dating sim needs deterministic selection (same image for same game state), pass `?order=id&offset=<deterministic_offset>` — or add a `seed` param to the random query later
 
 ---
 
