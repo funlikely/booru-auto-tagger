@@ -1,16 +1,18 @@
 # booru-auto-tagger: build plan
 
-A CLI tool that auto-tags a local directory of anime images using WD-tagger and exports a searchable static HTML gallery.
+A CLI tool that auto-tags a local directory of anime images using WD-tagger, stores results in SQLite, and serves them via a REST API + optional browser frontend.
+
+**Primary use case:** the database is queried by an external app (a dating sim) to select images based on game state and events.  
+**Secondary use case:** a local browser UI for browsing, reviewing, and correcting tags.
 
 ---
 
 ## Overview
 
-1. Python CLI scans an image directory
-2. WD-1.4-VITS-tagger (ONNX) runs inference on each image
-3. Raw Danbooru tags are mapped into five user-facing categories
-4. Results saved to `tags.json`
-5. A self-contained `index.html` is generated with a filterable grid
+1. Python CLI scans an image directory, runs WD-tagger inference, writes to SQLite
+2. Flask server exposes a REST API over the database
+3. The dating sim queries the API directly (`GET /images/random?posture=standing&mood=smile`)
+4. Browser frontend (two modes, same backend) for manual browsing and tag correction
 
 ---
 
@@ -18,11 +20,16 @@ A CLI tool that auto-tags a local directory of anime images using WD-tagger and 
 
 ```
 booru-auto-tagger/
-├── tag.py              # main CLI entrypoint
-├── tagger.py           # WD-tagger inference wrapper
+├── tag.py              # CLI entrypoint: scan dir, run inference, write DB
+├── tagger.py           # WD-tagger ONNX inference wrapper
 ├── categorize.py       # maps raw Danbooru tags → categories
-├── export.py           # renders index.html from tags.json
-├── template.html       # HTML/JS template for the gallery
+├── db.py               # SQLite schema, queries, connection management
+├── server.py           # Flask app: REST API + serves frontend
+├── frontend/
+│   ├── index.html      # shell with mode switcher
+│   ├── paginated.js    # mode 1: traditional grid + filter sidebar
+│   ├── infinite.js     # mode 2: infinite scroll masonry
+│   └── style.css
 ├── requirements.txt
 └── README.md
 ```
@@ -33,111 +40,247 @@ booru-auto-tagger/
 
 ### 1. Project setup
 - [ ] Create repo, virtualenv, `requirements.txt`
-- [ ] Dependencies: `onnxruntime`, `Pillow`, `numpy`, `huggingface_hub`, `jinja2`
+- [ ] Dependencies: `onnxruntime`, `Pillow`, `numpy`, `huggingface_hub`, `flask`, `flask-cors`
+- [ ] No ORM — use `sqlite3` from stdlib directly, keep it simple
 - [ ] Pin versions for reproducibility
 
-### 2. Model download (`tagger.py`)
+---
+
+### 2. Database (`db.py`)
+
+Schema:
+
+```sql
+CREATE TABLE images (
+    id          INTEGER PRIMARY KEY,
+    path        TEXT UNIQUE NOT NULL,   -- absolute or relative to configured root
+    rating      TEXT,                  -- 'safe' | 'questionable' | 'explicit'
+    tagged_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    manually_reviewed INTEGER DEFAULT 0
+);
+
+-- One row per tag per image; category is 'posture'/'body_type'/'clothing'/'undress'/'mood'/'raw'
+CREATE TABLE tags (
+    image_id    INTEGER NOT NULL REFERENCES images(id) ON DELETE CASCADE,
+    category    TEXT NOT NULL,
+    tag         TEXT NOT NULL,
+    UNIQUE(image_id, category, tag)
+);
+
+CREATE INDEX idx_tags_cat_tag  ON tags(category, tag);
+CREATE INDEX idx_tags_image_id ON tags(image_id);
+CREATE INDEX idx_images_rating ON images(rating);
+```
+
+Key functions to implement in `db.py`:
+- [ ] `init_db(path)` — create tables if not exist
+- [ ] `upsert_image(path, rating, category_tags, raw_tags)` — insert or replace
+- [ ] `is_tagged(path)` → bool — for skipping already-processed images
+- [ ] `query_images(filters, limit, offset, order)` → list of image rows
+  - `filters` is a dict like `{ "posture": ["standing", "sitting"], "mood": ["smile"] }`
+  - AND across categories, OR within a category
+  - `order`: `"random"` | `"id"` | `"path"`
+- [ ] `get_image(id)` → full image record with all tags
+- [ ] `update_tags(image_id, category, tags)` — for manual correction UI
+- [ ] `get_tag_counts(category)` → `{ tag: count }` — for populating filter UI
+
+---
+
+### 3. Model download (`tagger.py`)
 - [ ] On first run, use `huggingface_hub.hf_hub_download` to fetch:
   - Model: `SmilingWolf/wd-v1-4-vits-tagger-v2`
   - Files: `model.onnx`, `selected_tags.csv`
-- [ ] Cache to `~/.cache/booru-auto-tagger/` so it only downloads once
-- [ ] Confirm model is ~30 MB ONNX, runs on CPU via `onnxruntime`
+- [ ] Cache to `~/.cache/booru-auto-tagger/`
+- [ ] ~30 MB ONNX model, runs on CPU via `onnxruntime` (GPU optional via `onnxruntime-gpu`)
 
-### 3. Inference pipeline (`tagger.py`)
-- [ ] Load `selected_tags.csv` — this maps tag indices to Danbooru tag names + category (0=rating, 4=character, 9=general)
+---
+
+### 4. Inference pipeline (`tagger.py`)
+- [ ] Load `selected_tags.csv` — maps tag indices to Danbooru tag names + category (0=rating, 4=character, 9=general)
 - [ ] Preprocessing: resize image to 448×448, pad to square, normalize to [0,1], BGR channel order
 - [ ] Run ONNX session, get sigmoid output vector
-- [ ] Apply confidence threshold (default 0.35) to select active tags
+- [ ] Apply confidence threshold (default `0.35`, configurable) to select active tags
 - [ ] Return: `{ "rating": "safe"|"questionable"|"explicit", "tags": ["tag1", ...] }`
-- [ ] Handle corrupt/unreadable images gracefully (log and skip)
+- [ ] Handle corrupt/unreadable images gracefully (log + skip, do not crash run)
 
-### 4. Tag categorization (`categorize.py`)
-Map raw Danbooru tags to your five display categories. Each image gets one or more values per category. Suggested mappings:
+---
+
+### 5. Tag categorization (`categorize.py`)
+
+Map raw Danbooru tags to five display categories. Images can match multiple values per category.
 
 **Body posture**
-- Danbooru tags to watch: `standing`, `sitting`, `lying`, `kneeling`, `crouching`, `on_back`, `on_stomach`, `leaning_forward`, `arched_back`, `spread_legs`, `crossed_legs`, `arms_up`, `arms_behind_back`
+- `standing`, `sitting`, `lying`, `kneeling`, `crouching`, `on_back`, `on_stomach`,
+  `leaning_forward`, `arched_back`, `spread_legs`, `crossed_legs`, `arms_up`, `arms_behind_back`
 
 **Body type**
-- `loli`, `shota`, `tall_female`, `muscular`, `athletic`, `curvy`, `large_breasts`, `small_breasts`, `medium_breasts`, `wide_hips`, `slim`
-- Note: these tags exist in Danbooru vocabulary but coverage varies
+- `loli`, `tall_female`, `muscular`, `curvy`, `large_breasts`, `small_breasts`,
+  `medium_breasts`, `wide_hips`, `slim`, `athletic`
+- Coverage varies — treat as best-effort
 
 **Clothing type**
-- `school_uniform`, `maid`, `swimsuit`, `bikini`, `dress`, `kimono`, `armor`, `casual`, `sportswear`, `lingerie`, `naked_apron`, `hoodie`, `military_uniform`
-- Consider grouping into: uniform / casual / swimwear / formal / fantasy
+- `school_uniform`, `maid`, `swimsuit`, `bikini`, `dress`, `kimono`, `armor`,
+  `casual`, `sportswear`, `lingerie`, `naked_apron`, `hoodie`, `military_uniform`
+- Group into: uniform / casual / swimwear / formal / fantasy / lingerie
 
 **Degree of undress**
-- Primary signal: WD-tagger `rating` field (`safe` / `questionable` / `explicit`)
-- Secondary tags: `fully_clothed`, `partially_clothed`, `topless`, `bottomless`, `nude`, `naked`, `underwear_only`
-- Combine rating + clothing tags for a 5-point scale if desired
+- Primary: WD-tagger `rating` field (`safe` / `questionable` / `explicit`)
+- Secondary: `fully_clothed`, `partially_clothed`, `topless`, `bottomless`, `nude`, `underwear_only`
+- Combine into a 5-point scale if desired
 
 **Mood / emotional state**
-- `smile`, `happy`, `laughing`, `sad`, `crying`, `angry`, `embarrassed`, `blush`, `surprised`, `scared`, `serious`, `expressionless`, `sleepy`, `shy`
+- `smile`, `happy`, `laughing`, `sad`, `crying`, `angry`, `embarrassed`, `blush`,
+  `surprised`, `scared`, `serious`, `expressionless`, `sleepy`, `shy`
 
-Implementation notes:
-- Build a dict of `{ category: { display_value: [danbooru_tag, ...] } }`
-- An image can match multiple values in a category (e.g., both `sitting` and `arms_up`)
-- Unknown/unmapped tags are stored in a raw `tags` field for future use
+Implementation:
+- [ ] Define mapping as a plain Python dict in `categorize.py`
+- [ ] `categorize(raw_tags) → { category: [matched_values] }`
+- [ ] Unmatched tags go into `raw` category for future use / search
 
-### 5. Main CLI (`tag.py`)
-- [ ] `argparse` interface: `tag.py <image_dir> [--output ./output] [--threshold 0.35] [--force]`
+---
+
+### 6. CLI tagger (`tag.py`)
+- [ ] `argparse`: `tag.py <image_dir> [--db ./booru.db] [--threshold 0.35] [--force] [--workers N]`
 - [ ] Walk `image_dir` recursively for `.jpg`, `.jpeg`, `.png`, `.webp`
-- [ ] Load existing `tags.json` if present; skip already-tagged images unless `--force`
-- [ ] Show progress bar (`tqdm`)
-- [ ] Write `tags.json` after each image (so partial runs are resumable)
-- [ ] Call `export.py` automatically when done
+- [ ] Skip already-tagged images (check `db.is_tagged`) unless `--force`
+- [ ] Optional: `--workers N` for parallel inference (careful with ONNX session thread safety — use a process pool or serialize)
+- [ ] Progress bar via `tqdm`
+- [ ] Commits to DB in batches of ~100 for performance
+- [ ] Prints summary at end: N tagged, N skipped, N failed
 
-`tags.json` schema:
-```json
-{
-  "images": [
-    {
-      "path": "relative/path/to/image.jpg",
-      "rating": "safe",
-      "categories": {
-        "posture": ["standing", "arms_up"],
-        "body_type": ["large_breasts"],
-        "clothing": ["school_uniform"],
-        "undress": ["fully_clothed"],
-        "mood": ["smile", "blush"]
-      },
-      "raw_tags": ["1girl", "solo", "long_hair", "..."]
-    }
-  ]
-}
+---
+
+### 7. REST API (`server.py`)
+
+This is what the dating sim queries. Keep it simple and stable.
+
+**Endpoints:**
+
+```
+GET  /images
+     ?posture=standing,sitting   (comma-separated OR within category)
+     ?body_type=curvy
+     ?clothing=swimsuit
+     ?undress=topless
+     ?mood=smile,blush
+     ?rating=safe                (safe | questionable | explicit)
+     ?tag=long_hair              (raw tag search)
+     ?order=random|id|path       (default: random)
+     ?limit=20                   (default: 20, max: 200)
+     ?offset=0
+     → { total: N, images: [ { id, path, rating, categories, raw_tags } ] }
+
+GET  /images/<id>
+     → single image record with full tag data
+
+GET  /images/random              (convenience alias: order=random&limit=1)
+     ?<same filters as above>
+     → single image object (not wrapped in array)
+
+GET  /tags/<category>
+     → { tag: count } for populating filter dropdowns
+
+PATCH /images/<id>/tags          (for manual correction UI)
+      body: { "category": "mood", "tags": ["smile", "blush"] }
+      → updated image record
+
+GET  /health                     → { status: "ok", image_count: N }
 ```
 
-### 6. HTML export (`export.py` + `template.html`)
-- [ ] Use Jinja2 to render `template.html` with inlined `tags.json`
-- [ ] Output: single `index.html` (images load from their original paths, or optionally copy to output dir)
-- [ ] Gallery layout: CSS grid, ~200px thumbnails
-- [ ] Filter sidebar: one collapsible section per category, checkbox list of values
-  - Filtering logic: AND across categories, OR within a category
-- [ ] Search box: filters by raw tag name (substring match)
-- [ ] Tag chips shown on hover or below each image
-- [ ] Result count shown ("142 of 500 images")
-- [ ] All filter/search logic in vanilla JS — no frameworks, no server
+Notes:
+- [ ] `flask-cors` enabled so the dating sim can query from a different origin/port
+- [ ] All image paths returned as absolute paths (or configurable base URL for serving images)
+- [ ] Add `GET /images/<id>/file` to serve the actual image file if needed
+- [ ] Keep auth out of scope for now — this is a local tool
 
-### 7. Polish
-- [ ] `--copy-images` flag: copies images into output dir so `index.html` is fully portable
-- [ ] `--open` flag: open browser automatically after export
-- [ ] Sort options in the gallery (by filename, by rating, random)
-- [ ] "Unknown" fallback shown for images where a category couldn't be determined
-- [ ] README with setup instructions and example output screenshot
+---
+
+### 8. Frontend (`frontend/`)
+
+Single `index.html` shell that loads one of two JS modules based on a toggle stored in `localStorage`.
+
+#### Shared across both modes
+- [ ] Filter sidebar: one collapsible section per category, checkbox list (populated from `GET /tags/<category>`)
+- [ ] Rating filter (safe / questionable / explicit checkboxes)
+- [ ] Raw tag search box
+- [ ] Result count display ("Showing 142 of 3,891 matching images")
+- [ ] Mode toggle button (persists in localStorage)
+- [ ] Click image → opens detail panel with full tag list + edit controls
+- [ ] Tag edit UI: per-category chip editor, saves via `PATCH /images/<id>/tags`
+
+#### Mode 1 — Paginated (`paginated.js`)
+- [ ] Fixed grid layout (CSS grid, uniform ~220px cells)
+- [ ] Previous / Next page buttons + page number input
+- [ ] Page size selector (20 / 50 / 100)
+- [ ] URL reflects current filters + page so it's bookmarkable
+
+#### Mode 2 — Infinite scroll (`infinite.js`)
+- [ ] Masonry layout (CSS columns or a lightweight lib like `Masonry.js`)
+- [ ] `IntersectionObserver` on a sentinel element at the bottom — fires `GET /images?offset=N` when visible
+- [ ] Deduplication guard (track loaded IDs to avoid repeats on re-query)
+- [ ] "Back to top" button appears after scrolling past ~3 screens
+- [ ] Smooth loading skeleton cards while fetching
+
+---
+
+### 9. Image serving
+- [ ] `server.py` should serve images from the configured image root via `GET /files/<path:filename>`
+- [ ] Use `send_from_directory` (Flask) — safe against path traversal
+- [ ] Optional: generate thumbnails on first request, cache to `~/.cache/booru-auto-tagger/thumbs/`
+  - Thumbnails at 400px wide, JPEG quality 80 — big win for frontend performance at 51k images
+
+---
+
+### 10. Configuration
+- [ ] Simple `config.json` (or env vars) for:
+  - `image_root` — base directory for images
+  - `db_path` — path to SQLite file
+  - `host` / `port` for the server (default `127.0.0.1:5000`)
+  - `threshold` — default inference confidence cutoff
+- [ ] Dating sim reads `config.json` too so it knows where the server is
+
+---
+
+## Dating sim integration notes
+
+The dating sim queries `GET /images/random` with filters derived from game state, e.g.:
+
+```
+# character is happy, wearing a school uniform, scene is "classroom"
+GET /images/random?mood=smile,happy&clothing=school_uniform&rating=safe
+```
+
+Recommendations:
+- Cache the server URL in the dating sim's config
+- Use `rating` filter aggressively to stay in appropriate content zones per scene
+- Consider adding a `character` filter later if your images are organized by character subdirectory — easy to add as a column on `images`
+- If the dating sim needs deterministic selection (same image for same game state), pass `?order=id&seed=<state_hash>` — or add a `seed` param to the random query later
+
+---
+
+## Performance notes for 51k images
+
+- Inference: ~1–5s/image on CPU → budget 15–70 hours for a full run. Use `--workers` and/or a GPU via `onnxruntime-gpu` to speed up.
+- DB: SQLite handles 51k rows trivially. Filtered queries with indexes should return in <10ms.
+- Frontend: with thumbnails, page/scroll loads should feel instant. Without thumbnails, loading 50 full-size images per scroll event will be slow — thumbnails are not optional at this scale.
+- Consider running the tagger in batches by subdirectory so you can start using the UI before the full run completes.
 
 ---
 
 ## Known gotchas
 
-- WD-tagger was trained on Danbooru data; tag coverage is uneven for body type compared to clothing/mood
-- The `rating` field from WD-tagger is more reliable than trying to infer undress from clothing tags alone — use it as the primary signal
-- Images with multiple characters will confuse body-type tags; single-character images work best
-- ONNX CPU inference is ~1–5s/image; a 1000-image library takes ~15–30 min first run
+- WD-tagger tag coverage is uneven: clothing and mood are reliable, body type is hit-or-miss
+- `rating` from WD-tagger is the most reliable undress signal — weight it heavily
+- Images with multiple characters confuse body-type and posture tags
+- ONNX session is not thread-safe by default — if parallelizing, use `multiprocessing`, not `threading`
+- SQLite has one writer at a time — fine here since only the tagger writes; the server is read-mostly
 
 ---
 
 ## Possible future extensions
 
-- Manual tag correction UI (serve `index.html` via Flask, add POST endpoint to edit `tags.json`)
-- Batch re-tag with a newer/different model without losing manual corrections
-- Export to Hydrus Network or similar local booru software
-- Duplicate detection before tagging
+- Character tagging: if subdirectory names = character names, add that as a filter automatically
+- Duplicate detection (perceptual hash) before tagging
+- Re-tag with a newer model without losing manual corrections (keep `manually_reviewed` flag)
+- Export to Hydrus Network
+- Auth layer if the server ever leaves localhost
