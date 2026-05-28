@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>booru-auto-tagger</title>
+  <link rel="stylesheet" href="/frontend/style.css" />
+</head>
+<body>
+  <header>
+    <h1>booru-auto-tagger</h1>
+    <div class="header-controls">
+      <span id="result-count" class="result-count"></span>
+      <button id="mode-toggle" type="button">mode: paginated</button>
+    </div>
+  </header>
+
+  <main>
+    <aside id="sidebar">
+      <section>
+        <label for="raw-tag-search">raw tag search</label>
+        <input id="raw-tag-search" type="text" placeholder="e.g. long_hair" />
+      </section>
+
+      <section>
+        <h3>rating</h3>
+        <div id="filter-rating" class="filter-list">
+          <label><input type="checkbox" value="safe" /> safe</label>
+          <label><input type="checkbox" value="questionable" /> questionable</label>
+          <label><input type="checkbox" value="explicit" /> explicit</label>
+        </div>
+      </section>
+
+      <details open>
+        <summary>posture</summary>
+        <div id="filter-posture" class="filter-list"></div>
+      </details>
+      <details>
+        <summary>body_type</summary>
+        <div id="filter-body_type" class="filter-list"></div>
+      </details>
+      <details open>
+        <summary>clothing</summary>
+        <div id="filter-clothing" class="filter-list"></div>
+      </details>
+      <details>
+        <summary>undress</summary>
+        <div id="filter-undress" class="filter-list"></div>
+      </details>
+      <details open>
+        <summary>mood</summary>
+        <div id="filter-mood" class="filter-list"></div>
+      </details>
+
+      <button id="apply-filters" type="button">apply</button>
+      <button id="clear-filters" type="button">clear</button>
+    </aside>
+
+    <section id="content"></section>
+
+    <aside id="detail-panel" hidden>
+      <button id="detail-close" type="button">&times;</button>
+      <img id="detail-image" alt="" />
+      <div id="detail-meta"></div>
+      <div id="detail-editor"></div>
+    </aside>
+  </main>
+
+  <script type="module" src="/frontend/app.js"></script>
+</body>
+</html>

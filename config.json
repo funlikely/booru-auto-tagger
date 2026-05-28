@@ -1,0 +1,9 @@
+{
+  "image_root": "./images",
+  "db_path": "./booru.db",
+  "host": "127.0.0.1",
+  "port": 5000,
+  "threshold": 0.35,
+  "thumbnail_width": 400,
+  "thumbnail_quality": 80
+}

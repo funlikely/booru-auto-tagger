@@ -1,0 +1,7 @@
+onnxruntime==1.19.2
+Pillow==10.4.0
+numpy==1.26.4
+huggingface_hub==0.25.2
+flask==3.0.3
+flask-cors==5.0.0
+tqdm==4.66.5
